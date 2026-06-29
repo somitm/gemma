@@ -1,11 +1,14 @@
 """The agent — the harness drive loop. Grows one primitive per chapter.
 
-ch-01 — Model only. The whole "agent" is one stateless model call. There is no
-loop, no history, no tools, no instructions. Every call is independent, which is
-exactly why it can't remember anything yet (watch it forget in the demo).
+ch-02 — Loop + history. The model is still stateless: every call is independent.
+So the harness keeps the conversation in a list and replays the whole thing on
+every turn. That list — plus the append/replay/append loop in ``send`` — is the
+entire reason the agent now feels like it remembers.
 
-The call goes through the ``model/`` seam (``chat`` + ``Provider``), so swapping
-providers never touches this file — that is the seam earning its keep from day one.
+  The model isn't stateful. The harness is.
+
+The single ``chat`` call still goes through the ``model/`` seam, so swapping
+providers never touches this file.
 """
 
 from __future__ import annotations
@@ -14,27 +17,24 @@ from model import Provider, chat
 
 
 class Agent:
-    """A thin, stateless wrapper around a single model call. No memory (yet)."""
+    """A model wrapped in conversation memory the harness owns."""
 
     def __init__(self, model: str | None = None, provider: Provider | None = None) -> None:
         self.model = model
         self.provider = provider
-        # NO self.messages — ch-01 is stateless; the demo's "watch it forget" depends on this.
+        self.messages: list[dict] = []  # <-- the ONLY new attribute over ch-01
 
     def send(self, user_text: str) -> str:
-        """Send one message, return the model's reply. Nothing is carried over."""
-        resp = chat(
-            [{"role": "user", "content": user_text}],
-            model=self.model,
-            provider=self.provider,
-        )
+        """Append the turn, replay the whole history, keep the reply."""
+        self.messages.append({"role": "user", "content": user_text})
+        resp = chat(self.messages, model=self.model, provider=self.provider)
+        self.messages.append({"role": "assistant", "content": resp.content})
         return resp.content
 
 
 def main() -> None:
     agent = Agent()
-    print("agent ready (ch-01) — stateless: every turn is an independent model call,")
-    print("so it can't remember anything yet (watch it forget). Ctrl-D to exit.")
+    print("agent ready (ch-02) — it remembers within this session. Ctrl-D to exit.")
     while True:
         try:
             user = input("you> ")

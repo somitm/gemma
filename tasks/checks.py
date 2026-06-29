@@ -65,3 +65,30 @@ def _demo_ch01() -> None:
 
 ACCEPTANCE["ch-01"] = _accept_ch01
 DEMOS["ch-01"] = _demo_ch01
+
+
+# ----------------------------------------------------------------------------
+# ch-02 — History (the harness owns the conversation, replayed each turn)
+# ----------------------------------------------------------------------------
+def _accept_ch02() -> bool:
+    """The real agent recalls a fact stated on an earlier turn."""
+    from harness import agent
+
+    a = agent.Agent()
+    a.send("Your name is Gemma. Please remember it.")
+    reply = a.send("What is your name? Reply with just the name.")
+    print("model replied:", repr(reply))
+    return "gemma" in reply.lower()
+
+
+def _demo_ch02() -> None:
+    from harness import agent
+
+    a = agent.Agent()
+    for turn in ["Your name is Gemma.", "What is your name?"]:
+        print("you>", turn)
+        print("bot>", a.send(turn))
+
+
+ACCEPTANCE["ch-02"] = _accept_ch02
+DEMOS["ch-02"] = _demo_ch02
