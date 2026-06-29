@@ -6,15 +6,19 @@ bad write can't escape to the host. By default it's a fresh scratch dir, so an
 experiment can't touch your real project; point ``root`` at a real repo only if
 you mean it.
 
-At ch-03 this is just the class — the accept check stages an ``AGENTS.md`` here to
-prove auto-loaded instructions work. The write/edit *tools* that let the model
-build a multi-file project arrive at ch-05, once the agent has a tool interface.
+At ch-03 this was just the class — the accept staged an ``AGENTS.md`` here to
+prove auto-loaded instructions work. Now that the agent has a tool interface
+(ch-05), the write/edit *tools* below let the model build a multi-file project:
+each call goes through ``Workspace``, so every path is confined to the root and
+the files survive across calls for ``bash`` (run in the same dir) to see.
 """
 
 from __future__ import annotations
 
 import tempfile
 from pathlib import Path
+
+from harness.tools import Tool
 
 
 class Workspace:
@@ -49,3 +53,33 @@ class Workspace:
             return f"error: text to replace not found in {path}"
         p.write_text(text.replace(old, new, 1))
         return f"edited {path}"
+
+
+def write_file_tool(ws: Workspace) -> Tool:
+    return Tool(
+        name="write_file",
+        description="Create or overwrite a file in the workspace.",
+        parameters={
+            "type": "object",
+            "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+            "required": ["path", "content"],
+        },
+        func=ws.write,
+    )
+
+
+def edit_file_tool(ws: Workspace) -> Tool:
+    return Tool(
+        name="edit_file",
+        description="Replace the first occurrence of `old` with `new` in a workspace file.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "old": {"type": "string"},
+                "new": {"type": "string"},
+            },
+            "required": ["path", "old", "new"],
+        },
+        func=ws.edit,
+    )

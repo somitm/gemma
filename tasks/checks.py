@@ -182,3 +182,116 @@ def _demo_ch04() -> None:
 
 ACCEPTANCE["ch-04"] = _accept_ch04
 DEMOS["ch-04"] = _demo_ch04
+
+
+# ----------------------------------------------------------------------------
+# ch-05 — Tools (a tool interface + approval gate + file editing over a workspace)
+# ----------------------------------------------------------------------------
+def _accept_ch05_tools() -> bool:
+    """The real model calls the calculator tool and reports the exact product."""
+    from harness import agent
+    from harness.tools import default_tools
+
+    a = agent.Agent(system="Use tools when they help.", tools=default_tools())
+    reply = a.send("Use the calculator to compute 47 * 89, then reply with just the number.")
+    print("model replied:", repr(reply))
+    used_tool = any(m.get("role") == "tool" for m in a.messages)
+    print("used a tool:", used_tool)
+    return "4183" in reply and used_tool
+
+
+def _accept_ch05_approval() -> bool:
+    """A real bash request is intercepted by the gate and denied (never runs)."""
+    from harness import agent
+    from harness.sandbox import Sandbox, bash_tool
+    from harness.tools import default_tools
+
+    asked: list[tuple[str, str]] = []
+
+    def deny(name: str, args: str) -> bool:
+        asked.append((name, args))
+        return False
+
+    tools = default_tools()
+    tools.register(bash_tool(Sandbox()))
+    a = agent.Agent(
+        system="Use the bash tool to run shell commands when asked.",
+        tools=tools,
+        approve=deny,
+        approval_required={"bash"},
+    )
+    a.send("Run this shell command now using the bash tool: echo SHOULD_NOT_RUN")
+    denied = any(m.get("role") == "tool" and "denied" in m["content"].lower() for m in a.messages)
+    print("gate asked:", asked, "| denied:", denied)
+    return len(asked) >= 1 and denied
+
+
+def _build_workspace_agent():
+    from harness import agent
+    from harness.sandbox import Sandbox, bash_tool
+    from harness.tools import default_tools
+    from harness.workspace import Workspace, edit_file_tool, write_file_tool
+
+    ws = Workspace()  # fresh scratch dir
+    tools = default_tools()
+    tools.register(write_file_tool(ws))
+    tools.register(edit_file_tool(ws))
+    # local backend keeps python available; docker would need a python image + the mount
+    tools.register(bash_tool(Sandbox(prefer_docker=False), workdir=str(ws.root)))
+    a = agent.Agent(
+        system="You build files. Use write_file to create them and bash to run them.",
+        tools=tools,
+    )
+    return a, ws
+
+
+def _accept_ch05_fileedit() -> bool:
+    """The agent writes a file into the workspace and runs it there — persistence
+    (the file survives) + the workspace seam (bash sees the file it wrote)."""
+    a, ws = _build_workspace_agent()
+    a.send("Create hello.py that prints exactly WORKSPACE_OK, then run it with: python3 hello.py")
+    wrote = (ws.root / "hello.py").is_file()
+    ran = any(
+        "WORKSPACE_OK" in str(m.get("content", "")) for m in a.messages if m.get("role") == "tool"
+    )
+    print("wrote hello.py:", wrote, "| ran in workspace:", ran)
+    return wrote and ran
+
+
+def _accept_ch05() -> bool:
+    """Tools = a tool interface + an approval gate + file editing over a workspace."""
+    return _accept_ch05_tools() and _accept_ch05_approval() and _accept_ch05_fileedit()
+
+
+def _demo_ch05() -> None:
+    from harness import agent
+    from harness.sandbox import Sandbox, bash_tool
+    from harness.tools import default_tools
+
+    a = agent.Agent(tools=default_tools())
+    print("— a tool the model calls —")
+    print("bot>", a.send("What is 1234 * 5678? Use the calculator."), "\n")
+
+    tools = default_tools()
+    tools.register(bash_tool(Sandbox()))
+    gated = agent.Agent(
+        system="Use bash when asked.",
+        tools=tools,
+        approve=lambda n, args: False,
+        approval_required={"bash"},
+    )
+    print("— a boundary-crossing tool, denied by the gate —")
+    print("bot>", gated.send("Run: echo hello (use bash)"))
+    print("(the gate denied the bash call — it never executed)\n")
+
+    a2, ws = _build_workspace_agent()
+    a2.send(
+        "Create greet.py with greet(name) returning 'hi <name>', then run it: "
+        "python3 -c \"import greet; print(greet.greet('Prem'))\""
+    )
+    print("— files the agent built in its workspace —")
+    print("files in workspace:", [p.name for p in ws.root.iterdir()])
+
+
+ACCEPTANCE["ch-05"] = _accept_ch05
+DEMOS["ch-05"] = _demo_ch05
