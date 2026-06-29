@@ -1,36 +1,36 @@
 """The agent — the harness drive loop. Grows one primitive per chapter.
 
-ch-05 — Tools. Until now the model could only talk; now it can *act*. It returns
-tool calls, the harness runs them, feeds the results back, and the model keeps
-going until it has a final answer. The model decides *what* to do; the harness
-decides *how* — and is the one that actually runs anything.
+ch-06 — Context management. Tool loops make the history grow without bound, and
+a finite window can't hold it all. The model didn't get worse — what's in front
+of it changed. So the harness manages the window with two cheap moves:
 
-``send`` now ends in ``_run``: a bounded loop (``MAX_TOOL_STEPS``) that calls the
-model with the available tool specs. If the reply asks for tools, the harness
-appends the assistant turn (with its tool calls), executes each call, appends the
-raw result as a ``tool`` message, and loops. Otherwise it returns the final text.
+* Compaction. Before each model call, if the history's estimated size exceeds
+  ``context_limit``, summarize the middle and keep the head + tail intact. The
+  conversation stays coherent past the limit instead of falling off the back.
+* Door control. Every item entering the prompt is clamped to a max size first —
+  ``@file`` blocks (in ``harness/context.py``) and tool results (here). One huge
+  output can't flood the window and crowd out everything that matters.
 
-Some tools cross a boundary (a shell, the filesystem). Those can be named in
-``approval_required``; before such a tool runs, the harness asks an ``approve``
-callback, and feeds back ``[denied by approval gate]`` if refused. With no
-approver wired, a gated tool *fails closed* — it is denied, never run.
-
-The instruction layers (ch-03) and context delivery (ch-04) are unchanged: the
-system prompt + AGENTS.md head the payload, and ``@path`` files are injected
-before the turn. The single ``chat`` call still goes through the ``model/`` seam.
+Everything from ch-05 is unchanged: the system prompt + AGENTS.md head the
+payload, ``@path`` files are injected, tools run through ``_run`` behind the
+approval gate, and the single ``chat`` call still goes through the ``model/`` seam.
 """
 
 from __future__ import annotations
 
+import argparse
 from collections.abc import Callable
 
+from harness.compaction import compact, estimate_tokens
 from harness.context import deliver
 from harness.instructions import load_agents_md
+from harness.limits import clamp
 from harness.tools import ToolRegistry
 from model import Provider, chat
 
 DEFAULT_SYSTEM = "You are a concise, helpful coding assistant. Use tools when they help."
 MAX_TOOL_STEPS = 6
+DEFAULT_CONTEXT_LIMIT = 4000  # ~tokens; compact the history above this
 
 
 class Agent:
@@ -45,6 +45,7 @@ class Agent:
         tools: ToolRegistry | None = None,
         approve: Callable[[str, str], bool] | None = None,
         approval_required: set[str] | None = None,
+        context_limit: int = DEFAULT_CONTEXT_LIMIT,
     ) -> None:
         self.model = model
         self.provider = provider
@@ -53,11 +54,22 @@ class Agent:
         self.tools = tools
         self.approve = approve
         self.approval_required = approval_required or set()
+        self.context_limit = context_limit
         self.messages: list[dict] = []
+        # Set true whenever the last turn triggered compaction — the REPL reads
+        # this to surface that the window was managed (a demoable, visible event).
+        self.just_compacted = False
 
     def _approved(self, name: str, args: str) -> bool:
         # Fail closed: a tool marked as requiring approval with no approver is denied.
         return self.approve(name, args) if self.approve else False
+
+    def _maybe_compact(self) -> None:
+        # Estimate the window cheaply; compact only when it overruns the budget.
+        self.just_compacted = False
+        if estimate_tokens(self.messages) > self.context_limit:
+            self.messages = compact(self.messages, model=self.model)
+            self.just_compacted = True
 
     def _system_text(self) -> str:
         """The instruction layer = built-in system prompt + project AGENTS.md."""
@@ -79,6 +91,7 @@ class Agent:
 
     def _run(self) -> str:
         """Drive the model, executing tool calls until it produces a final answer."""
+        self._maybe_compact()
         specs = self.tools.specs() if self.tools else None
         for _ in range(MAX_TOOL_STEPS):
             resp = chat(self._payload(), model=self.model, tools=specs, provider=self.provider)
@@ -100,7 +113,7 @@ class Agent:
                     else:
                         result = self.tools.call(name, args)
                     self.messages.append(
-                        {"role": "tool", "tool_call_id": tc.get("id", ""), "content": result}
+                        {"role": "tool", "tool_call_id": tc.get("id", ""), "content": clamp(result)}
                     )
                 continue
             self.messages.append({"role": "assistant", "content": resp.content})
@@ -124,13 +137,27 @@ def main() -> None:
     def approve(name: str, args: str) -> bool:
         return input(f"  approve {name}({args})? [y/N] ").strip().lower() in ("y", "yes")
 
+    parser = argparse.ArgumentParser(prog="agent")
+    parser.add_argument(
+        "--context-limit",
+        type=int,
+        default=DEFAULT_CONTEXT_LIMIT,
+        help="token budget before the window is compacted (default: %(default)s). "
+        "Set it low, e.g. 400, to watch compaction fire live.",
+    )
+    args = parser.parse_args()
+
     agent = Agent(
         system=DEFAULT_SYSTEM,
         tools=tools,
         approve=approve,
         approval_required={"bash", "write_file", "edit_file"},
+        context_limit=args.context_limit,
     )
-    print("agent ready (ch-05) — with tools + an approval gate. Ctrl-D to exit.")
+    print(
+        f"agent ready (ch-06) — tools + an approval gate + a managed window "
+        f"(context limit {agent.context_limit}). Ctrl-D to exit."
+    )
     while True:
         try:
             user = input("you> ")
@@ -139,7 +166,10 @@ def main() -> None:
             break
         if not user.strip():
             continue
-        print("bot>", agent.send(user))
+        reply = agent.send(user)
+        if agent.just_compacted:
+            print("[context compacted — kept the start and end, summarized the middle]")
+        print("bot>", reply)
 
 
 if __name__ == "__main__":

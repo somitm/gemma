@@ -295,3 +295,92 @@ def _demo_ch05() -> None:
 
 ACCEPTANCE["ch-05"] = _accept_ch05
 DEMOS["ch-05"] = _demo_ch05
+
+
+# ----------------------------------------------------------------------------
+# ch-06 — Context management (compaction + door control / per-item size caps)
+# ----------------------------------------------------------------------------
+def _accept_ch06_compaction() -> bool:
+    """History is compacted past the limit, and the agent still recalls a key fact."""
+    from harness import agent
+
+    a = agent.Agent(system="You are concise.", context_limit=80)
+    a.send("Important: the deploy key is GRIFFIN-7. Keep it in mind.")
+    for i in range(8):
+        a.send(f"Acknowledge note {i} in a few words.")
+    compacted = any(str(m.get("content", "")).startswith("[summary") for m in a.messages)
+    reply = a.send("What is the deploy key? Reply with just the key.")
+    print("compaction happened:", compacted, "| reply:", repr(reply))
+    return compacted and "griffin-7" in reply.lower()
+
+
+def _accept_ch06_doorcontrol() -> bool:
+    """A huge @file block and a huge tool result are both clamped in the live loop."""
+    import tempfile
+    from pathlib import Path
+
+    from harness import agent
+    from harness.context import deliver
+    from harness.limits import MAX_ITEM_CHARS
+    from harness.tools import Tool, default_tools
+
+    # 1. @file delivery is clamped
+    d = Path(tempfile.mkdtemp())
+    (d / "big.txt").write_text("X" * (MAX_ITEM_CHARS * 4))
+    blocks = deliver(f"@{d / 'big.txt'} summarize")
+    block_capped = (
+        bool(blocks) and len(blocks[0]) <= MAX_ITEM_CHARS + 100 and "truncated" in blocks[0]
+    )
+
+    # 2. a huge tool result is clamped inside a real model turn
+    tools = default_tools()
+    tools.register(
+        Tool(
+            name="dump",
+            description="Return a large blob of text.",
+            parameters={"type": "object", "properties": {}, "required": []},
+            func=lambda: "Z" * (MAX_ITEM_CHARS * 4),
+        )
+    )
+    a = agent.Agent(system="Call the dump tool, then say DONE.", tools=tools)
+    a.send("Call the dump tool now.")
+    tool_msgs = [m for m in a.messages if m.get("role") == "tool"]
+    result_capped = bool(tool_msgs) and all(
+        len(m["content"]) <= MAX_ITEM_CHARS + 100 for m in tool_msgs
+    )
+
+    print("block_capped:", block_capped, "| result_capped:", result_capped)
+    return block_capped and result_capped
+
+
+def _accept_ch06() -> bool:
+    """Context management = compaction + door control / per-item size caps."""
+    return _accept_ch06_compaction() and _accept_ch06_doorcontrol()
+
+
+def _demo_ch06() -> None:
+    import tempfile
+    from pathlib import Path
+
+    from harness import agent
+    from harness.compaction import estimate_tokens
+    from harness.context import deliver
+
+    a = agent.Agent(context_limit=80)
+    a.send("Remember: the project codename is CRIME MASTER GOGO.")
+    for i in range(8):
+        a.send(f"Acknowledge note {i}.")
+    print("history messages:", len(a.messages), "~tokens:", estimate_tokens(a.messages))
+    print("compacted:", any(str(m.get("content", "")).startswith("[summary") for m in a.messages))
+    print("bot>", a.send("What is the project codename?"))
+
+    d = Path(tempfile.mkdtemp())
+    log = d / "log.txt"
+    log.write_text("line\n" * 20000)
+    block = deliver(f"@{log} read")[0]
+    print(f"\ninjected block length: {len(block)} chars (file was {log.stat().st_size})")
+    print(block[-60:])
+
+
+ACCEPTANCE["ch-06"] = _accept_ch06
+DEMOS["ch-06"] = _demo_ch06
