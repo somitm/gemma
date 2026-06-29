@@ -3,18 +3,20 @@
 A single model turn is not a workflow. The orchestrator plans a task into steps,
 runs them in order through an agent, gates each step (approval), and retries on
 failure — work moving through time with checkpoints, not one shot.
-
-It composes the ``Agent`` without changing it: the loop stays exactly as ch-09
-left it, and orchestration is a thin planner-plus-driver wrapped around it.
 """
 
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from model import chat
+
+if TYPE_CHECKING:
+    from harness.observability import Tracer
 
 _PLANNER = (
     "You are a planner. Break the task into 2-4 short imperative steps. "
@@ -30,15 +32,20 @@ class OrchestratorResult:
 
 
 class Orchestrator:
-    def __init__(self, model: str | None = None) -> None:
+    def __init__(self, model: str | None = None, tracer: Tracer | None = None) -> None:
         self.model = model
+        self.tracer = tracer  # optional; default None => no behavior change (ch-10)
 
     def _plan(self, task: str) -> list[str]:
+        # ch-13: wrap the planner's LLM call in a `plan` span when a tracer is given.
+        t0 = time.perf_counter()
         text = chat(
             [{"role": "system", "content": _PLANNER}, {"role": "user", "content": task}],
             model=self.model,
             max_tokens=400,
         ).content.strip()
+        if self.tracer is not None:
+            self.tracer.record_plan(time.perf_counter() - t0)
         try:
             arr = json.loads(text[text.index("[") : text.rindex("]") + 1])
             steps = [str(s) for s in arr if str(s).strip()]

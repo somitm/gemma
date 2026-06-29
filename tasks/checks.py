@@ -746,3 +746,56 @@ def _demo_ch12() -> None:
 
 ACCEPTANCE["ch-12"] = _accept_ch12
 DEMOS["ch-12"] = _demo_ch12
+
+
+# ----------------------------------------------------------------------------
+# ch-13 — Observability
+# ----------------------------------------------------------------------------
+def _accept_ch13_observability() -> bool:
+    """A real run produces a trace with model calls (tokens) and tool calls."""
+    from harness import agent
+    from harness.observability import Tracer
+    from harness.tools import default_tools
+
+    tr = Tracer()
+    a = agent.Agent(system="Use tools when helpful.", tools=default_tools(), tracer=tr)
+    a.send("Use the calculator to compute 123 * 9, then report the result.")
+    print(tr.timeline())
+    t = tr.totals()
+    return t["llm_calls"] >= 1 and t["tokens"] > 0 and t["tool_calls"] >= 1
+
+
+def _accept_ch13_depth() -> bool:
+    """A real tool-using run records the tool's args AND result in the trace."""
+    from harness import agent
+    from harness.observability import Tracer
+    from harness.tools import default_tools
+
+    tr = Tracer()
+    a = agent.Agent(system="Use tools when helpful.", tools=default_tools(), tracer=tr)
+    a.send("Use the calculator to compute 111 * 11, then report it.")
+    print(tr.timeline())
+    tool_events = [e for e in tr.events if e.kind == "tool"]
+    captured = bool(tool_events) and bool(tool_events[0].args) and bool(tool_events[0].result)
+    has_value = any("1221" in e.result for e in tool_events)
+    return captured and has_value
+
+
+def _accept_ch13() -> bool:
+    """Observability = trace tokens/tools + tool arg/result depth."""
+    return _accept_ch13_observability() and _accept_ch13_depth()
+
+
+def _demo_ch13() -> None:
+    from harness import agent
+    from harness.observability import Tracer
+    from harness.tools import default_tools
+
+    tr = Tracer()
+    a = agent.Agent(tools=default_tools(), tracer=tr)
+    a.send("Compute 256 / 8 with the calculator, then say the result.")
+    print(tr.timeline())
+
+
+ACCEPTANCE["ch-13"] = _accept_ch13
+DEMOS["ch-13"] = _demo_ch13

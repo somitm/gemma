@@ -1,0 +1,355 @@
+"""Observability (ch-13).
+
+A trace of every step — model calls (tokens, latency, cost) and tool calls (args,
+result, status) — so a multi-step run is replayable. The interesting bug is usually
+a few tool calls before the failure; you can't tune what you can't see.
+
+The ``Tracer`` carries the bits a UI needs to *show* a run rather than print it:
+- ``cost`` per model call (priced from usage), and ``status`` per step (ok /
+  denied / error / pass / fail) so the trace can be color-coded;
+- verify steps are recorded (``record_verify``) so the self-verify loop is visible;
+- a ``turn`` index (bumped by ``turn_start``) so events nest under their turn;
+- an ``on_event`` hook so a live UI can refresh as each event lands.
+All of it is additive — pass no tracer and the loop is unchanged.
+
+Alongside the flat ``Event`` list, the tracer builds an **OTel GenAI span tree** —
+same single emit, two shapes. ``turn_start`` opens an ``invoke_agent`` parent span;
+``record_llm`` adds a child ``chat`` span; ``record_tool`` adds a child
+``execute_tool`` span — each carrying the exact ``gen_ai.*`` attribute names from
+``harness.events``. An exporter seam (``SpanExporter``) mirrors the provider seam:
+the default is a no-op, but the same spans can graduate to OTLP.
+"""
+
+from __future__ import annotations
+
+import os
+from collections.abc import Callable
+from dataclasses import asdict, dataclass, field, fields
+
+from harness import events
+from harness.events import NullExporter, Span, SpanExporter
+from harness.limits import clamp
+from model.pricing import cost_from_usage
+
+
+@dataclass
+class Event:
+    kind: str  # "llm" | "tool" | "verify"
+    label: str
+    seconds: float
+    tokens: int = 0
+    args: str = ""  # tool input
+    result: str = ""  # tool output
+    cost: float = 0.0  # USD for this step
+    status: str = ""  # ok | denied | error | pass | fail
+    turn: int = 0  # which user turn this step belongs to
+
+
+def _capture_content_default() -> bool:
+    """OTel makes message content opt-in and off by default (privacy)."""
+    flag = os.environ.get("OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT", "")
+    return flag.strip().lower() in ("1", "true", "yes", "on")
+
+
+@dataclass
+class Tracer:
+    events: list[Event] = field(default_factory=list)
+    model: str | None = None  # used to price llm calls
+    on_event: Callable[[Event], None] | None = None  # live-UI hook
+    # --- OTel span model (additive) ------------------------------------------
+    spans: list[Span] = field(default_factory=list)
+    exporter: SpanExporter = field(default_factory=NullExporter)
+    provider_name: str = "openai"  # gen_ai.provider.name (OpenAI-compatible flavor)
+    server_address: str | None = None
+    server_port: int | None = None
+    conversation_id: str | None = None  # our session id → gen_ai.conversation.id
+    capture_content: bool = field(default_factory=_capture_content_default)
+    _turn: int = 0
+    _span_seq: int = 0
+    _turn_span_id: str | None = None  # current invoke_agent parent
+
+    def turn_start(self) -> None:
+        """Begin a new user turn; subsequent events nest under it.
+
+        Also opens a per-turn ``invoke_agent`` parent span. Its ``duration_s`` is
+        filled in lazily from the sum of its children when spans are assembled.
+        """
+        self._turn += 1
+        span_id = self._next_span_id()
+        attrs: dict = {
+            events.OPERATION_NAME: events.INVOKE_AGENT,
+            events.AGENT_NAME: self.model or "agent",
+        }
+        if self.conversation_id is not None:
+            attrs[events.CONVERSATION_ID] = self.conversation_id
+        self.spans.append(
+            Span(
+                span_id=span_id,
+                parent_id=None,
+                name=f"invoke_agent {self.model or 'agent'}",
+                kind=events.CLIENT,
+                operation=events.INVOKE_AGENT,
+                attributes=attrs,
+            )
+        )
+        self._turn_span_id = span_id
+
+    def _next_span_id(self) -> str:
+        self._span_seq += 1
+        return f"span-{self._span_seq}"
+
+    def _emit(self, event: Event) -> None:
+        self.events.append(event)
+        if self.on_event:
+            self.on_event(event)
+
+    def record_llm(
+        self,
+        usage: dict,
+        seconds: float,
+        *,
+        finish_reason: str | None = None,
+        request_model: str | None = None,
+        response_id: str | None = None,
+        messages: list[dict] | None = None,
+        output: str | None = None,
+    ) -> None:
+        cost = cost_from_usage(self.model, usage)
+        self._emit(
+            Event(
+                "llm",
+                "model call",
+                seconds,
+                tokens=int(usage.get("total_tokens", 0)),
+                cost=cost,
+                status="ok",
+                turn=self._turn,
+            )
+        )
+        self._add_chat_span(
+            usage,
+            seconds,
+            cost,
+            finish_reason=finish_reason,
+            request_model=request_model,
+            response_id=response_id,
+            messages=messages,
+            output=output,
+        )
+
+    def _add_chat_span(
+        self,
+        usage: dict,
+        seconds: float,
+        cost: float,
+        *,
+        finish_reason: str | None,
+        request_model: str | None,
+        response_id: str | None,
+        messages: list[dict] | None,
+        output: str | None,
+    ) -> None:
+        model = request_model or self.model
+        in_tokens = int(usage.get("prompt_tokens", 0) or 0)
+        out_tokens = int(usage.get("completion_tokens", 0) or 0)
+        if not in_tokens and not out_tokens:
+            in_tokens = int(usage.get("total_tokens", 0) or 0)
+        attrs: dict = {
+            events.OPERATION_NAME: events.CHAT,
+            events.PROVIDER_NAME: self.provider_name,
+            events.REQUEST_MODEL: model,
+            events.USAGE_INPUT_TOKENS: in_tokens,
+            events.USAGE_OUTPUT_TOKENS: out_tokens,
+            events.USAGE_COST: cost,  # our extension
+        }
+        if finish_reason is not None:
+            attrs[events.RESPONSE_FINISH_REASONS] = [finish_reason]
+        if response_id is not None:
+            attrs[events.RESPONSE_ID] = response_id
+        if self.server_address is not None:
+            attrs[events.SERVER_ADDRESS] = self.server_address
+        if self.server_port is not None:
+            attrs[events.SERVER_PORT] = self.server_port
+        if self.conversation_id is not None:
+            attrs[events.CONVERSATION_ID] = self.conversation_id
+        if self.capture_content:
+            if messages is not None:
+                attrs[events.INPUT_MESSAGES] = self._content_messages(messages)
+                sys_text = next(
+                    (m.get("content", "") for m in messages if m.get("role") == "system"), ""
+                )
+                if sys_text:
+                    attrs[events.SYSTEM_INSTRUCTIONS] = sys_text
+            if output is not None:
+                attrs[events.OUTPUT_MESSAGES] = output
+        self.spans.append(
+            Span(
+                span_id=self._next_span_id(),
+                parent_id=self._turn_span_id,
+                name=f"chat {model}" if model else "chat",
+                kind=events.CLIENT,
+                operation=events.CHAT,
+                attributes=attrs,
+                status="ok",
+                duration_s=seconds,
+            )
+        )
+
+    @staticmethod
+    def _content_messages(messages: list[dict]) -> list[dict]:
+        return [{"role": m.get("role", ""), "content": m.get("content", "")} for m in messages]
+
+    def record_tool(
+        self,
+        name: str,
+        seconds: float,
+        args: str = "",
+        result: str = "",
+        status: str = "ok",
+        *,
+        call_id: str | None = None,
+        description: str | None = None,
+    ) -> None:
+        # Keep the trace small but replayable — clamp the captured I/O.
+        self._emit(
+            Event(
+                "tool",
+                name,
+                seconds,
+                args=clamp(args, 120),
+                result=clamp(result, 120),
+                status=status,
+                turn=self._turn,
+            )
+        )
+        attrs: dict = {
+            events.OPERATION_NAME: events.EXECUTE_TOOL,
+            events.TOOL_NAME: name,
+            events.TOOL_TYPE: "function",
+        }
+        if call_id is not None:
+            attrs[events.TOOL_CALL_ID] = call_id
+        if description is not None:
+            attrs[events.TOOL_DESCRIPTION] = description
+        if status == "error":
+            attrs[events.ERROR_TYPE] = "error"
+        if self.capture_content:
+            attrs[events.INPUT_MESSAGES] = args
+            attrs[events.OUTPUT_MESSAGES] = result
+        self.spans.append(
+            Span(
+                span_id=self._next_span_id(),
+                parent_id=self._turn_span_id,
+                name=f"execute_tool {name}",
+                kind=events.INTERNAL,
+                operation=events.EXECUTE_TOOL,
+                attributes=attrs,
+                status=status,
+                duration_s=seconds,
+            )
+        )
+
+    def record_verify(self, passed: bool, seconds: float, detail: str = "") -> None:
+        """Record one self-verify attempt — makes the ch-12 verify loop visible.
+
+        Also adds an INTERNAL span with a custom ``verify`` operation — this is a
+        NON-STANDARD extension; OTel GenAI has no verify operation.
+        """
+        self._emit(
+            Event(
+                "verify",
+                "verify",
+                seconds,
+                result=clamp(detail, 120),
+                status="pass" if passed else "fail",
+                turn=self._turn,
+            )
+        )
+        self.spans.append(
+            Span(
+                span_id=self._next_span_id(),
+                parent_id=self._turn_span_id,
+                name="verify",
+                kind=events.INTERNAL,
+                operation="verify",  # custom, non-standard extension
+                attributes={events.OPERATION_NAME: "verify"},
+                status="ok" if passed else "error",
+                duration_s=seconds,
+            )
+        )
+
+    def record_plan(self, seconds: float, *, status: str = "ok") -> None:
+        """Record a planning step as a ``plan`` span (ch-10 orchestrator).
+
+        Span-only (the planner's LLM call has no flat Event here). Like every other
+        ``record_*`` method, the span's ``duration_s`` is the caller-measured
+        ``seconds`` — never a fresh clock read — and it nests under the current turn.
+        """
+        self.spans.append(
+            Span(
+                span_id=self._next_span_id(),
+                parent_id=self._turn_span_id,
+                name="plan",
+                kind=events.INTERNAL,
+                operation=events.PLAN,
+                attributes={events.OPERATION_NAME: events.PLAN},
+                status=status,
+                duration_s=seconds,
+            )
+        )
+
+    def get_spans(self) -> list[Span]:
+        """Return the full OTel span list, with invoke_agent durations assembled.
+
+        An ``invoke_agent`` span's ``duration_s`` is the sum of its children's
+        durations — derived, never read from a fresh clock (offline-deterministic).
+        """
+        child_totals: dict[str, float] = {}
+        for s in self.spans:
+            if s.parent_id is not None:
+                child_totals[s.parent_id] = child_totals.get(s.parent_id, 0.0) + s.duration_s
+        for s in self.spans:
+            if s.operation == events.INVOKE_AGENT:
+                s.duration_s = child_totals.get(s.span_id, 0.0)
+        return self.spans
+
+    def export(self) -> None:
+        """Hand the assembled spans to the exporter seam (default: no-op)."""
+        self.exporter.export(self.get_spans())
+
+    def dump_events(self) -> list[dict]:
+        """Serialize events for persistence — so a trace survives a restart."""
+        return [asdict(e) for e in self.events]
+
+    def load_events(self, rows: list[dict]) -> None:
+        """Restore persisted events and continue turn numbering from where they left off."""
+        known = {f.name for f in fields(Event)}
+        self.events = [Event(**{k: v for k, v in r.items() if k in known}) for r in rows]
+        self._turn = max((e.turn for e in self.events), default=0)
+
+    def totals(self) -> dict:
+        return {
+            "llm_calls": sum(e.kind == "llm" for e in self.events),
+            "tool_calls": sum(e.kind == "tool" for e in self.events),
+            "tokens": sum(e.tokens for e in self.events),
+            "cost": round(sum(e.cost for e in self.events), 6),
+            "seconds": round(sum(e.seconds for e in self.events), 3),
+        }
+
+    def timeline(self) -> str:
+        lines = []
+        for i, e in enumerate(self.events):
+            if e.kind == "llm":
+                extra = f"{e.tokens} tok ${e.cost:.4f}"
+            elif e.kind == "verify":
+                extra = e.status
+            else:
+                extra = f"{e.args} -> {e.result}".strip()
+            lines.append(f"{i:>2} {e.kind:<6} {e.label:<16} {e.seconds * 1000:6.0f} ms {extra}")
+        t = self.totals()
+        lines.append("   " + "-" * 42)
+        lines.append(
+            f"   {t['llm_calls']} llm · {t['tool_calls']} tool · "
+            f"{t['tokens']} tok · ${t['cost']:.4f} · {t['seconds']} s"
+        )
+        return "\n".join(lines)

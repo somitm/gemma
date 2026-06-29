@@ -1,44 +1,38 @@
 """The agent — the harness drive loop. Grows one primitive per chapter.
 
-ch-12 — Verification. Until now the agent answered and the harness trusted the
-answer. Verification closes that gap — but not by having the harness run the
-test. The *model* runs it, with the bash tool it already has, over the same
-workspace it writes into. The harness's job is to *enforce*: it will not accept
-"done" until it has OBSERVED, in the tool-call transcript, a real passing run of
-the required check (a bash call that ran the test and exited 0). A narrated
-"it works" is never enough — no receipt, no acceptance.
+ch-13 — Observability. The agent has done real work for many chapters; now we can
+finally *see* it. A ``Tracer`` (``harness/observability.py``) threads through the
+loop and records every step: each model call with its tokens, latency, finish
+reason, and cost; each tool call with its arguments, result, and status; each
+verification with pass/fail. The turn is wrapped in one parent span so the whole
+run reads as a tree (OTel GenAI semantic conventions, in ``harness/events.py``).
 
-Two layers set what the harness requires:
-- Standing policy (system prompt, from here on): "Before you report a coding
-  task done, verify it — run a check with bash and show the real result." The
-  model always tries to verify.
-- Strong external oracle: when the user @-references a test file
-  (``write is_prime.py that passes @test_is_prime.py``), the harness makes THAT
-  file the required check for the turn — a specific test the model did not write.
-  The @file content is also injected as context (ch-04 delivery) so the model
-  sees the spec, then the harness demands an observed passing ``python3 <file>``.
+The seam is deliberate. The default ``Tracer`` is silent and offline (a
+``NullExporter``), so ``verify`` stays deterministic; drop in an OTLP-backed
+exporter and the same spans flow to Jaeger/Honeycomb. Cost comes from
+``model/pricing.py``. Trace persistence, dormant in ``memory.py`` since durable
+state landed, fires now: a resumed session restores its trace too. The hooks are
+additive — pass no tracer and the loop runs exactly as before.
 
-If the model tries to finish without a real pass — or the run failed — the
-harness feeds back "I don't see a passing run of <test> — run it, it must pass"
-and loops, capped at ``verify_attempts``. It never stands up its own test
-environment; the environment is the ch-08 sandbox over the workspace.
-
-Everything from ch-11 is unchanged: subagents/fan-out, durable sessions,
-episodic recall, the hardened sandbox, usage-based compaction, skills, door
-control, ``@path`` injection, and the approval gate.
+Everything from ch-12 is unchanged: the enforced-run verification gate (the model
+runs the test with bash; the harness will not accept "done" without an observed
+passing run), subagents/fan-out, durable sessions, the hardened sandbox,
+usage-based compaction, skills, the approval gate, and ``@path`` injection.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import time
 from collections.abc import Callable
 
 from harness.compaction import compact, estimate_tokens
 from harness.context import deliver
 from harness.instructions import load_agents_md, test_command
 from harness.limits import clamp
-from harness.memory import DEFAULT_DIR, load_session, save_session
+from harness.memory import DEFAULT_DIR, load_session, load_trace, save_session, save_trace
+from harness.observability import Tracer
 from harness.skills import Skill, skills_prompt
 from harness.tools import ToolRegistry
 from model import Provider, chat
@@ -93,6 +87,7 @@ class Agent:
         sessions_dir: str = DEFAULT_DIR,
         verify_attempts: int = 3,
         require_run: bool = True,
+        tracer: Tracer | None = None,
     ) -> None:
         self.model = model
         self.provider = provider
@@ -115,6 +110,10 @@ class Agent:
         # ch-12: when a turn changes code, refuse "done" until a real passing run
         # of the project's declared test command is observed. require_run opts out.
         self.require_run = require_run
+        self.tracer = tracer
+        # ch-13: restore the persisted trace too, so it isn't empty on resume.
+        if self.tracer is not None and session:
+            self.tracer.load_events(load_trace(session, sessions_dir))
 
     def _approved(self, name: str, args: str) -> bool:
         # Fail closed: a tool marked as requiring approval with no approver is denied.
@@ -124,6 +123,8 @@ class Agent:
         # Durable state: persist the full history so a restart can resume it.
         if self.session:
             save_session(self.session, self.messages, self.sessions_dir)
+            if self.tracer is not None:
+                save_trace(self.session, self.tracer.dump_events(), self.sessions_dir)
 
     def _maybe_compact(self) -> None:
         # ch-08: prefer the model's reported usage; fall back to an estimate on turn one.
@@ -156,6 +157,8 @@ class Agent:
     def send(self, user_text: str) -> str:
         """Inject @path files, run the loop, then — if this turn changed code —
         enforce a real passing run of the project's tests before returning."""
+        if self.tracer:
+            self.tracer.turn_start()  # ch-13: nest this turn's steps under one span
         for block in deliver(user_text):  # @file references → injected context
             self.messages.append({"role": "user", "content": f"Context file:\n{block}"})
         self.messages.append({"role": "user", "content": user_text})
@@ -187,14 +190,18 @@ class Agent:
         """If this turn changed code, refuse "done" until a real passing run of the
         project's declared test command (AGENTS.md ``## Testing``) is observed in the
         transcript. The model runs it with bash; the harness only watches the
-        receipts. Capped at verify_attempts. No command, or no code change → no gate."""
+        receipts. Capped at verify_attempts so a model that will not run it cannot
+        hang the loop. No declared command, or no code change → no gate."""
         if not self.require_run:
             return reply
         command = test_command(self.agents_dir)
         if not command or not self._changed_code(turn_start):
             return reply
         for _ in range(self.verify_attempts):
-            if self._observed_pass(command, turn_start):
+            passed = self._observed_pass(command, turn_start)
+            if self.tracer:
+                self.tracer.record_verify(passed, 0.0, f"required: {command}")
+            if passed:
                 return reply
             self.messages.append(
                 {
@@ -234,8 +241,19 @@ class Agent:
         self._maybe_compact()
         specs = self.tools.specs() if self.tools else None
         for _ in range(MAX_TOOL_STEPS):
-            resp = chat(self._payload(), model=self.model, tools=specs, provider=self.provider)
+            t0 = time.perf_counter()
+            payload = self._payload()
+            resp = chat(payload, model=self.model, tools=specs, provider=self.provider)
             self._last_tokens = int(resp.usage.get("total_tokens", 0)) or self._last_tokens
+            if self.tracer:
+                self.tracer.record_llm(
+                    resp.usage,
+                    time.perf_counter() - t0,
+                    finish_reason=resp.finish_reason,
+                    request_model=self.model,
+                    messages=payload,  # optional content; captured only when enabled
+                    output=resp.content,
+                )
             if resp.tool_calls and self.tools is not None:
                 self.messages.append(
                     {
@@ -248,11 +266,17 @@ class Agent:
                     fn = tc.get("function", {})
                     name = fn.get("name", "")
                     args = fn.get("arguments", "")
-                    # A boundary-crossing tool must clear the approval gate first.
+                    t1 = time.perf_counter()
                     if name in self.approval_required and not self._approved(name, args):
                         result = "[denied by approval gate]"
+                        status = "denied"
                     else:
                         result = self.tools.call(name, args)
+                        status = "error" if result.startswith("error") else "ok"
+                    if self.tracer:
+                        self.tracer.record_tool(
+                            name, time.perf_counter() - t1, args=args, result=result, status=status
+                        )
                     self.messages.append(
                         {"role": "tool", "tool_call_id": tc.get("id", ""), "content": clamp(result)}
                     )
@@ -305,6 +329,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    tracer = Tracer()  # ch-13: record every step; print the timeline after each turn
     agent = Agent(
         system=DEFAULT_SYSTEM,
         tools=tools,
@@ -314,11 +339,12 @@ def main() -> None:
         skills=load_skills("skills"),
         session="repl",
         agents_dir=str(workspace.root),  # read AGENTS.md (incl. ## Testing) from the project
+        tracer=tracer,
     )
     print(
-        "agent ready (ch-12) — the harness enforces a real passing run before 'done'; "
-        "plan tasks with /plan; durable sessions, sandboxed tools, approval gate, "
-        "managed window, skills. Ctrl-D to exit."
+        "agent ready (ch-13) — observable runs (a trace with tokens + cost after each "
+        "turn); change code and the harness enforces the project's tests before 'done'; "
+        "/plan; durable sessions, approval gate, skills. Ctrl-D to exit."
     )
     orchestrator = Orchestrator()
     try:
@@ -347,6 +373,7 @@ def main() -> None:
             if agent.just_compacted:
                 print("[context compacted — kept the start and end, summarized the middle]")
             print("bot>", reply)
+            print(tracer.timeline())
     finally:
         cleanup()
 
