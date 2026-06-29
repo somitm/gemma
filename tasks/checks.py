@@ -799,3 +799,34 @@ def _demo_ch13() -> None:
 
 ACCEPTANCE["ch-13"] = _accept_ch13
 DEMOS["ch-13"] = _demo_ch13
+
+
+# ----------------------------------------------------------------------------
+# ch-14 — UI (Textual TUI)
+# ----------------------------------------------------------------------------
+def _drive_tui_turn(prompt: str) -> dict:
+    """Run one real turn through the TUI headlessly and report what rendered.
+
+    The pilot logic lives in ``ui/`` so that ``tasks/`` never imports textual —
+    the only textual importer in non-test code is ``ui/``.
+    """
+    from ui.tui import run_headless_turn
+
+    return run_headless_turn(prompt)
+
+
+def _accept_ch14() -> bool:
+    """A real model turn driven through the TUI renders a transcript and a trace
+    with at least one turn span — the UI makes the loop + observability visible."""
+    r = _drive_tui_turn("In one short sentence, say hello.")
+    print("rendered:", r)
+    return (not r["busy"]) and r["turns"] >= 1 and r["spans"] >= 1 and r["log_lines"] > 0
+
+
+def _demo_ch14() -> None:
+    r = _drive_tui_turn("Say hello in one short sentence.")
+    print(f"TUI turn rendered → turns={r['turns']} spans={r['spans']} log_lines={r['log_lines']}")
+
+
+ACCEPTANCE["ch-14"] = _accept_ch14
+DEMOS["ch-14"] = _demo_ch14
