@@ -122,3 +122,31 @@ tests/episodes/ # one behavioral test file per chapter (test_ch01..test_ch14)
 The code is three packages with dependencies pointing one way: `ui/` → `harness/` → `model/`. The core
 never imports the UI. `model/` talks to a model, `harness/` is the loop and every primitive, `ui/`
 renders it. The agent loop lives only in `harness/agent.py`; the REPL is the `agent` console script.
+
+## Why it's built this way
+
+The architecture is part of the lesson. A few principles run through every chapter:
+
+**Boundaries that point one direction.** The model, the harness, and the UI depend in a straight line,
+and the core never reaches up to the UI. That single rule is what lets you swap the model or replace the
+interface without touching the loop. When the boundary is honest in the code, the thesis stops being a
+slogan.
+
+**Every seam is built to be faked.** The places where the agent meets the outside world, the model, the
+trace exporter, the sandbox, are shaped so a test can stand in for the real thing with no network. We
+optimized for what is easy to swap and verify, not for what looks elegant in a diagram. A seam you can
+fake is a seam you can trust.
+
+**Observability you can read, not import.** The trace is written to the OpenTelemetry conventions by
+hand, so the standard is something you learn rather than a dependency you pull in. The same trace runs
+offline for tests and exports to a real backend when you want it. Capturing prompts and results is
+opt-in, off by default.
+
+**Two gates, because "tests pass" is weaker than "it works."** A stub that returns the right shape
+proves nothing about a real model. So every chapter passes an offline check and then does the thing for
+real against a live model. The second gate is slower on purpose: the repo never claims a capability it
+has not shown end to end.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
