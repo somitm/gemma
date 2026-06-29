@@ -7,9 +7,9 @@ or an error string the model can read and recover from.
 
 Tools are an API surface you expose to a model: keep the list small, keep each
 contract narrow, and validate arguments. ``calculator`` evaluates arithmetic
-without ``eval``; ``read_file`` returns a file's contents. (``read_file`` is
-unscoped here — it can read any path. Confining tools to a workspace is the
-execution-environment concern of ch-08.)
+without ``eval``; ``read_file`` returns a file's contents — and as of ch-08 it
+is confined to the workspace: a model-invoked tool must not wander the host
+filesystem, so paths are resolved and must live under the working directory.
 """
 
 from __future__ import annotations
@@ -48,8 +48,15 @@ def calculator(expression: str) -> str:
 
 
 def read_file(path: str) -> str:
-    """Return a file's contents, or an error string."""
-    p = Path(path)
+    """Return a file's contents — confined to the workspace (ch-08 hardening).
+
+    The model-invoked tool must not wander the host filesystem (no /etc/passwd).
+    Paths are resolved and must live under the current working directory.
+    """
+    root = Path.cwd().resolve()
+    p = Path(path).resolve()
+    if p != root and root not in p.parents:
+        return f"error: path outside workspace: {path}"
     return p.read_text() if p.is_file() else f"error: no such file: {path}"
 
 

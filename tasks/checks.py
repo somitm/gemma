@@ -422,3 +422,92 @@ def _demo_ch07() -> None:
 
 ACCEPTANCE["ch-07"] = _accept_ch07
 DEMOS["ch-07"] = _demo_ch07
+
+
+# ----------------------------------------------------------------------------
+# ch-08 — Execution environment
+# ----------------------------------------------------------------------------
+def _accept_ch08() -> bool:
+    """Execution environment = a hardened sandbox + the boundary fixes that make
+    it trustworthy: read_file confined to the workspace, the verifier scrubbed of
+    host env, and compaction keyed off the model's reported token usage."""
+    return _accept_ch08_sandbox() and _accept_ch08_hardening()
+
+
+def _accept_ch08_sandbox() -> bool:
+    """The model runs a command via the sandboxed bash tool, and host secrets
+    don't leak into the sandbox."""
+    import os
+
+    from harness import agent
+    from harness.sandbox import Sandbox, bash_tool
+    from harness.tools import default_tools
+
+    sandbox = Sandbox()
+
+    # Containment: a parent-process secret must not be visible inside the sandbox.
+    os.environ["SANDBOX_SECRET"] = "POULTRY-FARM"
+    try:
+        contained = sandbox.run("printenv SANDBOX_SECRET || echo CLEAN")
+    finally:
+        del os.environ["SANDBOX_SECRET"]
+    leaked = "POULTRY-FARM" in contained.stdout
+    print(f"backend={contained.backend} secret_leaked={leaked}")
+
+    # Execution: the model drives the sandboxed bash tool.
+    tools = default_tools()
+    tools.register(bash_tool(sandbox))
+    a = agent.Agent(system="Use the bash tool to run shell commands.", tools=tools)
+    reply = a.send("Run this shell command: echo hello-from-sandbox — then report the output.")
+    ran = any(m.get("role") == "tool" for m in a.messages)
+    print("ran via tool:", ran, "| reply:", repr(reply))
+    return (not leaked) and ran and "hello-from-sandbox" in reply.lower()
+
+
+def _accept_ch08_hardening() -> bool:
+    """Verify the three hardening fixes hold against the real model / real fs."""
+    import os
+
+    from harness import agent
+    from harness.tools import read_file
+    from harness.verification import run_python
+
+    # 1. read_file is workspace-scoped
+    blocked = read_file("/etc/passwd").startswith("error: path outside")
+    allowed = "Build a Custom Agent Harness" in read_file("README.md")
+    scoped = blocked and allowed
+
+    # 2. the verifier does not inherit host env
+    os.environ["VERIFY_SECRET"] = "POULTRY-FARM"
+    try:
+        contained = run_python("import os", "assert os.getenv('VERIFY_SECRET') is None").passed
+    finally:
+        del os.environ["VERIFY_SECRET"]
+
+    # 3. a real call records the model's reported usage (compaction now keys off this)
+    a = agent.Agent(system="Be concise.")
+    a.send("Say hi in five words.")
+    usage_tracked = a._last_tokens > 0
+
+    print(f"scoped={scoped} contained={contained} usage={usage_tracked} tok={a._last_tokens}")
+    return scoped and contained and usage_tracked
+
+
+def _demo_ch08() -> None:
+    from harness import agent
+    from harness.sandbox import Sandbox, bash_tool
+    from harness.tools import default_tools, read_file
+    from harness.verification import run_python
+
+    tools = default_tools()
+    tools.register(bash_tool(Sandbox()))
+    a = agent.Agent(tools=tools)
+    print("bot>", a.send("Use bash to print the current working directory and the date."))
+
+    print("read_file('/etc/passwd') ->", read_file("/etc/passwd"))
+    proof = run_python("import os", "assert os.getenv('PATH')  # scrubbed PATH still set")
+    print("verifier runs in a scrubbed env:", proof.passed)
+
+
+ACCEPTANCE["ch-08"] = _accept_ch08
+DEMOS["ch-08"] = _demo_ch08

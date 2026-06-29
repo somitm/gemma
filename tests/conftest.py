@@ -1,27 +1,31 @@
-"""Per-suite pytest config for the episode tests.
+"""Test isolation (a ch-03 consequence).
 
-From ch-03 the agent auto-loads ``AGENTS.md`` from its working directory. The repo
-root has one (these very instructions), so a test that constructs ``Agent()`` with
-the default ``agents_dir="."`` would silently pick it up — ambient state leaking
-into the assertion. The ``isolate_cwd`` fixture runs every test in a fresh empty
-directory, so instruction auto-loading sees nothing unless a test stages a file
-itself. This is the "something worth isolating between tests" the agent now has.
+From ch-03 the agent auto-loads ``AGENTS.md`` from its working directory. The suite
+runs from the repo root, which *has* an ``AGENTS.md``, so a bare ``Agent()`` in an
+earlier chapter's test would silently pick up the real project instructions and skew
+its assertions. This is test infrastructure, not an agent primitive.
+
+The fix is surgical on purpose: ignore only the *ambient* AGENTS.md (the default
+``agents_dir="."``). We don't chdir or touch the real working directory, because
+other chapters' tests legitimately rely on it (ch-08 reads ``pyproject.toml`` from
+the repo root to prove read_file is workspace-scoped). Tests that exercise AGENTS.md
+pass an explicit ``agents_dir`` and flow through to the real loader unchanged.
 """
 
 from __future__ import annotations
-
-import os
-from collections.abc import Iterator
 
 import pytest
 
 
 @pytest.fixture(autouse=True)
-def isolate_cwd(tmp_path) -> Iterator[None]:
-    """Run each test in a clean temp dir so no ambient AGENTS.md is auto-loaded."""
-    prev = os.getcwd()
-    os.chdir(tmp_path)
-    try:
-        yield
-    finally:
-        os.chdir(prev)
+def _no_ambient_agents_md(monkeypatch):
+    import harness.agent as agent_mod
+
+    real = agent_mod.load_agents_md
+
+    def guarded(directory: str = ".", *args, **kwargs) -> str:
+        if str(directory) in (".", ""):  # the ambient default — don't read the repo's file
+            return ""
+        return real(directory, *args, **kwargs)
+
+    monkeypatch.setattr(agent_mod, "load_agents_md", guarded)

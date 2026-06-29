@@ -1,17 +1,19 @@
 """The agent — the harness drive loop. Grows one primitive per chapter.
 
-ch-07 — Skills. A skill is a reusable procedure stored as a file: a directory
-with a ``SKILL.md`` (name + description + body). Only each skill's one-line
-description is advertised in the system prompt; the model loads the full body on
-demand with the read_file tool. That's progressive disclosure — the window holds
-a menu, not every recipe, and the agent pulls the one it needs when it needs it.
+ch-08 — Execution environment. The model never runs code; the harness does,
+inside a boundary (``harness/sandbox.py``, now hardened: no network, non-root, a
+scrubbed environment with no inherited credentials). Two more boundary fixes land
+with it: ``read_file`` is confined to the workspace (no ``/etc/passwd``), and the
+verifier (``harness/verification.py``, exercised by tools, not yet by the loop)
+runs candidate code in a scrubbed process.
 
-The only change to the loop is in ``_system_text``: the instruction layer now
-joins three parts — the built-in system prompt, the project AGENTS.md, and the
-skills menu (``skills_prompt``). Everything from ch-06 is unchanged: the managed
-window (compaction + door control), ``@path`` file injection, tools through
-``_run`` behind the approval gate, and the single ``chat`` call through the
-``model/`` seam.
+The loop's only change is how compaction earns its token count. Until now it
+*estimated* the window from message length. Now that the boundary work has us
+reading the model's reported usage, ``_run`` captures ``resp.usage`` into
+``self._last_tokens`` and ``_maybe_compact`` *prefers that real number*, falling
+back to the estimate only on turn one. We were guessing; now the provider tells
+us. Everything from ch-07 is unchanged: skills, the managed window's door control
+(``clamp``), ``@path`` injection, tools behind the approval gate.
 """
 
 from __future__ import annotations
@@ -56,6 +58,7 @@ class Agent:
         self.approval_required = approval_required or set()
         self.context_limit = context_limit
         self.skills = skills or []
+        self._last_tokens = 0  # model-reported usage from the last call (ch-08)
         self.messages: list[dict] = []
         # Set true whenever the last turn triggered compaction — the REPL reads
         # this to surface that the window was managed (a demoable, visible event).
@@ -66,10 +69,12 @@ class Agent:
         return self.approve(name, args) if self.approve else False
 
     def _maybe_compact(self) -> None:
-        # Estimate the window cheaply; compact only when it overruns the budget.
+        # ch-08: prefer the model's reported usage; fall back to an estimate on turn one.
         self.just_compacted = False
-        if estimate_tokens(self.messages) > self.context_limit:
+        window = self._last_tokens or estimate_tokens(self.messages)
+        if window > self.context_limit:
             self.messages = compact(self.messages, model=self.model)
+            self._last_tokens = 0  # recomputed from the next response
             self.just_compacted = True
 
     def _system_text(self) -> str:
@@ -104,6 +109,7 @@ class Agent:
         specs = self.tools.specs() if self.tools else None
         for _ in range(MAX_TOOL_STEPS):
             resp = chat(self._payload(), model=self.model, tools=specs, provider=self.provider)
+            self._last_tokens = int(resp.usage.get("total_tokens", 0)) or self._last_tokens
             if resp.tool_calls and self.tools is not None:
                 self.messages.append(
                     {
@@ -166,7 +172,10 @@ def main() -> None:
         context_limit=args.context_limit,
         skills=load_skills("skills"),
     )
-    print("agent ready (ch-07) — tools, approval gate, managed window, skills. Ctrl-D to exit.")
+    print(
+        "agent ready (ch-08) — sandboxed tools, approval gate, managed window, skills. "
+        "Ctrl-D to exit."
+    )
     while True:
         try:
             user = input("you> ")
