@@ -47,16 +47,32 @@ def calculator(expression: str) -> str:
     return str(int(result) if result == int(result) else result)
 
 
-def read_file(path: str) -> str:
-    """Return a file's contents — confined to the workspace (ch-08 hardening).
+def _is_secret_file(p: Path) -> bool:
+    """A model-invoked read must never exfiltrate credentials. Refuse dotenv files,
+    private keys, and PEM/key material even when they sit inside the workspace."""
+    name = p.name
+    return (
+        name == ".env"
+        or name.startswith(".env.")
+        or name.startswith("id_")  # ssh private keys: id_rsa, id_ed25519, ...
+        or p.suffix in (".pem", ".key")
+    )
 
-    The model-invoked tool must not wander the host filesystem (no /etc/passwd).
-    Paths are resolved and must live under the current working directory.
+
+def read_file(path: str, root: str | Path | None = None) -> str:
+    """Return a file's contents — confined to a root (ch-08 hardening).
+
+    The model-invoked tool must not wander the host filesystem (no /etc/passwd) and
+    must not read secrets (no ``.env`` API-key exfiltration). Paths are resolved and
+    must live under ``root`` (the current working directory by default; the caller
+    binds it to the agent's workspace so reads and writes share one root).
     """
-    root = Path.cwd().resolve()
-    p = Path(path).resolve()
-    if p != root and root not in p.parents:
+    base = Path(root).resolve() if root else Path.cwd().resolve()
+    p = (base / path).resolve()
+    if p != base and base not in p.parents:
         return f"error: path outside workspace: {path}"
+    if _is_secret_file(p):
+        return f"error: refusing to read secret file: {path}"
     return p.read_text() if p.is_file() else f"error: no such file: {path}"
 
 
@@ -105,6 +121,27 @@ class ToolRegistry:
         return len(self._tools)
 
 
+def read_file_tool(root: str | Path | None = None) -> Tool:
+    """A ``read_file`` tool confined to ``root`` (defaults to the process cwd).
+
+    The mature agent binds this to its workspace so the model reads the same tree
+    it writes to — and never the host cwd (where ``.env`` lives)."""
+
+    def _read(path: str) -> str:
+        return read_file(path, root=root)
+
+    return Tool(
+        name="read_file",
+        description="Read a UTF-8 text file from disk and return its contents.",
+        parameters={
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        },
+        func=_read,
+    )
+
+
 def default_tools() -> ToolRegistry:
     reg = ToolRegistry()
     reg.register(
@@ -119,16 +156,5 @@ def default_tools() -> ToolRegistry:
             func=calculator,
         )
     )
-    reg.register(
-        Tool(
-            name="read_file",
-            description="Read a UTF-8 text file from disk and return its contents.",
-            parameters={
-                "type": "object",
-                "properties": {"path": {"type": "string"}},
-                "required": ["path"],
-            },
-            func=read_file,
-        )
-    )
+    reg.register(read_file_tool())
     return reg

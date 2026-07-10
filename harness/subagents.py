@@ -59,6 +59,10 @@ def fan_out_tool(model: str | None = None) -> Tool:
     ordered, so the model can read them as one block."""
 
     def fan_out_call(tasks: list[str]) -> str:
+        # The model sometimes passes a JSON string instead of a list; iterating that
+        # would spawn one subagent per character. Require a real list of strings.
+        if not isinstance(tasks, list) or not all(isinstance(t, str) for t in tasks):
+            return "error: `tasks` must be a list of strings"
         results = fan_out(tasks, model=model)
         return "\n\n".join(
             f"[subtask {i}] {task}\n{result}"

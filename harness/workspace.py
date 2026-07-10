@@ -50,6 +50,10 @@ class Workspace:
         p = self._safe(path)
         if not p.is_file():
             return f"error: no such file: {path}"
+        if old == "":
+            # An empty `old` is a substring of everything and would silently
+            # prepend `new` at offset 0 — reject it rather than corrupt the file.
+            return f"error: `old` must be non-empty to edit {path}"
         text = p.read_text()
         if old not in text:
             return f"error: text to replace not found in {path}"
@@ -119,7 +123,12 @@ def git_worktree(base: str | Path = ".") -> tuple[Workspace, Callable[[], None]]
     if add.returncode != 0:
         return None
     if (wt / "pyproject.toml").is_file():
-        subprocess.run(["uv", "sync"], cwd=wt, capture_output=True)
+        # Bounded so a cold cache (or a network stall) can't freeze launch before
+        # the UI ever appears; a failed/slow sync just means a colder first test run.
+        try:
+            subprocess.run(["uv", "sync"], cwd=wt, capture_output=True, timeout=120)
+        except subprocess.TimeoutExpired:
+            pass
 
     def cleanup() -> None:
         subprocess.run(

@@ -114,7 +114,9 @@ class Tracer:
         messages: list[dict] | None = None,
         output: str | None = None,
     ) -> None:
-        cost = cost_from_usage(self.model, usage)
+        # Price with the model actually called; ``self.model`` is the fallback when
+        # the caller doesn't pass one. (A model-less tracer would otherwise cost $0.)
+        cost = cost_from_usage(request_model or self.model, usage)
         self._emit(
             Event(
                 "llm",
@@ -281,10 +283,12 @@ class Tracer:
     def record_plan(self, seconds: float, *, status: str = "ok") -> None:
         """Record a planning step as a ``plan`` span (ch-10 orchestrator).
 
-        Span-only (the planner's LLM call has no flat Event here). Like every other
-        ``record_*`` method, the span's ``duration_s`` is the caller-measured
-        ``seconds`` — never a fresh clock read — and it nests under the current turn.
+        Emits both a flat ``Event`` (so a UI trace pane that renders events shows the
+        plan step) and an OTel ``plan`` span. Like every other ``record_*`` method,
+        the span's ``duration_s`` is the caller-measured ``seconds`` — never a fresh
+        clock read — and it nests under the current turn.
         """
+        self._emit(Event("plan", "plan", seconds, status=status, turn=self._turn))
         self.spans.append(
             Span(
                 span_id=self._next_span_id(),
