@@ -25,9 +25,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"no live acceptance check registered for '{chapter}'")
         return 2
 
-    model = os.environ.get("LLM_MODEL", "google/gemma-4-26b-a4b")
-    base = os.environ.get("LLM_BASE_URL", "http://192.168.189.144:1234/v1")
-    print(f"== live acceptance: {chapter}  (model={model} @ {base}) ==", flush=True)
+    # Resolve through the provider so the banner reports what the run actually
+    # targets — including values that live only in .env (loaded by from_env).
+    from model.provider import Provider
+
+    cfg = Provider.from_env()
+    print(f"== live acceptance: {chapter}  (model={cfg.model} @ {cfg.base_url}) ==", flush=True)
     try:
         ok = bool(check())
     except Exception as exc:  # noqa: BLE001

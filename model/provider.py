@@ -21,9 +21,27 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-DEFAULT_BASE_URL = "http://192.168.189.144:1234/v1"
+DEFAULT_BASE_URL = "http://localhost:1234/v1"
 DEFAULT_MODEL = "google/gemma-4-26b-a4b"
 DEFAULT_API_KEY = "lm-studio"
+
+
+def _unquote(value: str) -> str:
+    """Strip an inline ``# comment`` and matching surrounding quotes from a value.
+
+    Mirrors what python-dotenv does, so a key copied verbatim from a provider's
+    docs (``LLM_API_KEY="sk-..."``) doesn't ship its quotes into the auth header.
+    A ``#`` is only a comment when it follows whitespace, so URLs with fragments
+    survive; inside quotes nothing is stripped.
+    """
+    value = value.strip()
+    if value[:1] in ("'", '"') and value[-1:] == value[:1] and len(value) >= 2:
+        return value[1:-1]
+    # Unquoted: drop a trailing ` # comment` (whitespace-preceded hash only).
+    for i, ch in enumerate(value):
+        if ch == "#" and i > 0 and value[i - 1].isspace():
+            return value[:i].strip()
+    return value
 
 
 def _load_dotenv() -> None:
@@ -35,8 +53,10 @@ def _load_dotenv() -> None:
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
+        if line.startswith("export "):  # honor shell-style `export KEY=value`
+            line = line[len("export ") :].lstrip()
         key, _, value = line.partition("=")
-        os.environ.setdefault(key.strip(), value.strip())
+        os.environ.setdefault(key.strip(), _unquote(value))
 
 
 @dataclass

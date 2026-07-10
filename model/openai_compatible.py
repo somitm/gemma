@@ -53,13 +53,22 @@ def complete_openai(
     )
     resp.raise_for_status()
     data = resp.json()
-    choice = data["choices"][0]
-    msg = choice.get("message", {})
+
+    # OpenAI-compatible endpoints (notably OpenRouter) can return HTTP 200 with an
+    # ``{"error": ...}`` body, or an empty ``choices`` on a content filter. Surface
+    # the provider's own message instead of a bare KeyError/IndexError traceback.
+    choices = data.get("choices")
+    if not choices:
+        detail = data.get("error") or data
+        raise RuntimeError(f"model returned no choices: {detail}")
+
+    choice = choices[0]
+    msg = choice.get("message") or {}  # ``message: null`` on some filter finishes
     return LLMResponse(
         content=msg.get("content") or "",
         reasoning=msg.get("reasoning_content"),
         tool_calls=msg.get("tool_calls") or [],
-        usage=data.get("usage", {}),
+        usage=data.get("usage") or {},  # ``usage: null`` must not become None
         finish_reason=choice.get("finish_reason"),
         raw=data,
     )

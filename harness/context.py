@@ -31,7 +31,8 @@ def deliver(user_text: str) -> list[str]:
         if path.is_file():
             try:
                 body = path.read_text()
-            except OSError:
+            except (OSError, UnicodeDecodeError):
+                # Unreadable or binary (`@image.png`) — skip it, don't crash the turn.
                 continue
             blocks.append(clamp(f"--- {path} ---\n{body}"))
     return blocks
