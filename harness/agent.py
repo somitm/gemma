@@ -30,6 +30,7 @@ from collections.abc import Callable
 
 from harness.compaction import compact, estimate_tokens
 from harness.context import deliver
+from harness.harness_config import CONFIG
 from harness.instructions import load_agents_md, test_command
 from harness.limits import clamp
 from harness.memory import DEFAULT_DIR, load_session, load_trace, save_session, save_trace
@@ -38,37 +39,14 @@ from harness.skills import Skill, skills_prompt
 from harness.tools import ToolRegistry
 from model import OnDelta, Provider, chat
 
-DEFAULT_SYSTEM = (
-    "You are a concise, helpful coding assistant. Use tools when they help. "
-    "When you change code, verify it before reporting done: run the project's test "
-    "command with the bash tool and show the real result. Never claim it works on "
-    "your word alone — if you haven't run it, run it."
-)
-MAX_TOOL_STEPS = 6
-DEFAULT_CONTEXT_LIMIT = 4000  # ~tokens; compact the history above this
-APPROVAL_TOOLS = {"bash", "write_file", "edit_file"}  # tools the gate guards
-CODE_EXTENSIONS = {
-    ".py",
-    ".js",
-    ".ts",
-    ".tsx",
-    ".jsx",
-    ".go",
-    ".rs",
-    ".java",
-    ".rb",
-    ".c",
-    ".cpp",
-    ".cc",
-    ".h",
-    ".hpp",
-    ".cs",
-    ".php",
-    ".swift",
-    ".kt",
-    ".scala",
-    ".sh",
-}  # a write/edit of one of these arms the test gate (a code change to verify)
+# Behavioral knobs live in the editable surface (harness/harness_config.json);
+# these names are pure re-exports so existing imports keep working.
+DEFAULT_SYSTEM = CONFIG.system_prompt
+MAX_TOOL_STEPS = CONFIG.max_tool_steps
+DEFAULT_CONTEXT_LIMIT = CONFIG.default_context_limit  # ~tokens; compact above this
+APPROVAL_TOOLS = CONFIG.approval_tools  # tools the gate guards
+# a write/edit of one of these arms the test gate (a code change to verify)
+CODE_EXTENSIONS = CONFIG.code_extensions
 
 
 class Agent:
@@ -82,13 +60,13 @@ class Agent:
         agents_dir: str = ".",
         tools: ToolRegistry | None = None,
         approve: Callable[[str, str], bool] | None = None,
-        approval_required: set[str] | None = None,
+        approval_required: frozenset[str] | set[str] | None = None,
         context_limit: int = DEFAULT_CONTEXT_LIMIT,
         skills: list[Skill] | None = None,
         session: str | None = None,
         sessions_dir: str = DEFAULT_DIR,
-        verify_attempts: int = 3,
-        require_run: bool = True,
+        verify_attempts: int = CONFIG.verify_attempts,
+        require_run: bool = CONFIG.require_run,
         tracer: Tracer | None = None,
     ) -> None:
         self.model = model

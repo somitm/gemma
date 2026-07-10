@@ -17,6 +17,7 @@ import string
 import tempfile
 from pathlib import Path
 
+from harness.harness_config import CONFIG
 from harness.tools import Tool
 
 DEFAULT_DIR = ".sessions"
@@ -121,7 +122,7 @@ def list_sessions(base: str | Path = DEFAULT_DIR) -> list[dict]:
 def search_sessions(
     query: str,
     base: str | Path = DEFAULT_DIR,
-    limit: int = 5,
+    limit: int = CONFIG.memory_search_limit,
     *,
     exclude: str | None = None,
 ) -> list[dict]:

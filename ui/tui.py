@@ -35,6 +35,7 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Footer, Input, Label, Static, Tree
 
 import harness.agent as agent_mod
+from harness.harness_config import CONFIG
 from harness.memory import DEFAULT_DIR, delete_session, search_memory_tool
 from harness.observability import Tracer
 from harness.sandbox import Sandbox, bash_tool
@@ -45,7 +46,7 @@ from harness.workspace import Workspace, edit_file_tool, write_file_tool
 from model import Provider
 from model.pricing import format_cost
 
-APPROVAL_TOOLS = {"bash", "write_file", "edit_file"}
+APPROVAL_TOOLS = CONFIG.approval_tools  # from the editable surface — one source of truth
 _STATUS_COLOR = {"denied": "yellow", "error": "red", "fail": "red", "pass": "green", "ok": ""}
 _KIND_ICON = {"llm": "◆", "tool": "›", "verify": "✓", "plan": "▷"}
 

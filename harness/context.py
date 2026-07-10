@@ -15,9 +15,11 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from harness.harness_config import CONFIG
 from harness.limits import clamp
 
-_ATTACH = re.compile(r"@(\S+)")
+# the pattern travels as a string in the editable surface; compiled here, at the use site
+_ATTACH = re.compile(CONFIG.attach_pattern)
 
 
 def deliver(user_text: str) -> list[str]:

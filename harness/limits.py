@@ -7,7 +7,9 @@ poisoning); clamping each item at the door is the cheapest defense.
 
 from __future__ import annotations
 
-MAX_ITEM_CHARS = 4000
+from harness.harness_config import CONFIG
+
+MAX_ITEM_CHARS = CONFIG.max_item_chars  # re-export; the value lives in the editable surface
 
 
 def clamp(text: str, max_chars: int = MAX_ITEM_CHARS) -> str:

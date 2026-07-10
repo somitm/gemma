@@ -10,14 +10,11 @@ from __future__ import annotations
 
 import json
 
+from harness.harness_config import CONFIG
 from model import Provider, chat
 
-COMPACTION_PROMPT = (
-    "You are a context summarizer. Compress the conversation below into a short "
-    "checkpoint another model will use to continue. Preserve, verbatim, every "
-    "concrete fact, code, name, decision, file path, and the current goal and "
-    "next step. Drop chit-chat. Be terse but lose nothing the next turn needs."
-)
+# re-export; the summarizer's instructions live in the editable surface
+COMPACTION_PROMPT = CONFIG.compaction_prompt
 
 
 def estimate_tokens(messages: list[dict]) -> int:
