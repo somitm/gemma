@@ -17,6 +17,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -41,8 +42,17 @@ def run_python(code: str, check: str, timeout: float = 10.0) -> VerificationResu
     Model-written code runs with a *scrubbed* environment and a scoped temp
     workdir — the same start-closed posture as the bash sandbox, so we don't hand
     untrusted code our credentials (a real Docker sandbox would also cut network).
+
+    Success is signalled by a **per-run random nonce** printed only after ``check``
+    completes. A fixed sentinel (the old ``VERIFICATION_OK``) was forgeable: code
+    could print it and ``sys.exit(0)`` *before* the assertion ran, so ``assert
+    False`` still "passed". The nonce is unknown to the candidate, so an early exit
+    or a printed guess no longer counts as a pass. (Teaching-grade, not adversarial:
+    candidate code that reads its own source file could still recover the nonce —
+    genuine isolation is the sandbox chapter's Docker path; see the README.)
     """
-    script = f"{code}\n\n{check}\nprint('VERIFICATION_OK')\n"
+    nonce = f"VERIFIED-{uuid.uuid4().hex}"
+    script = f"{code}\n\n{check}\nprint({nonce!r})\n"
     workdir = Path(tempfile.mkdtemp(prefix="verify-"))
     candidate = workdir / "candidate.py"
     candidate.write_text(script)
@@ -59,5 +69,5 @@ def run_python(code: str, check: str, timeout: float = 10.0) -> VerificationResu
     except subprocess.TimeoutExpired:
         return VerificationResult(False, "error: timed out")
     output = (proc.stdout + proc.stderr).strip()
-    passed = proc.returncode == 0 and "VERIFICATION_OK" in proc.stdout
+    passed = proc.returncode == 0 and nonce in proc.stdout
     return VerificationResult(passed=passed, output=output)

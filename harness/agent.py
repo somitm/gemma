@@ -131,7 +131,7 @@ class Agent:
         self.just_compacted = False
         window = self._last_tokens or estimate_tokens(self.messages)
         if window > self.context_limit:
-            self.messages = compact(self.messages, model=self.model)
+            self.messages = compact(self.messages, model=self.model, provider=self.provider)
             self._last_tokens = 0  # recomputed from the next response
             self.just_compacted = True
 
@@ -159,6 +159,11 @@ class Agent:
         enforce a real passing run of the project's tests before returning."""
         if self.tracer:
             self.tracer.turn_start()  # ch-13: nest this turn's steps under one span
+        # Compact BEFORE this turn's messages are appended, so ``turn_start`` (an
+        # index) stays valid for the whole turn. Compacting mid-turn (inside _run)
+        # would renumber the list and make the verification gate read the wrong
+        # slice — silently skipping the required test run.
+        self._maybe_compact()
         for block in deliver(user_text):  # @file references → injected context
             self.messages.append({"role": "user", "content": f"Context file:\n{block}"})
         self.messages.append({"role": "user", "content": user_text})
@@ -188,20 +193,18 @@ class Agent:
 
     def _enforce_run(self, reply: str, turn_start: int) -> str:
         """If this turn changed code, refuse "done" until a real passing run of the
-        project's declared test command (AGENTS.md ``## Testing``) is observed in the
-        transcript. The model runs it with bash; the harness only watches the
+        project's declared test command (AGENTS.md ``## Testing``) is observed *after*
+        the change. The model runs it with bash; the harness only watches the
         receipts. Capped at verify_attempts so a model that will not run it cannot
-        hang the loop. No declared command, or no code change → no gate."""
+        hang the loop. On exhaustion the reply is marked unverified — the gate never
+        implies a pass it didn't see. No declared command, or no code change → no gate."""
         if not self.require_run:
             return reply
         command = test_command(self.agents_dir)
         if not command or not self._changed_code(turn_start):
             return reply
         for _ in range(self.verify_attempts):
-            passed = self._observed_pass(command, turn_start)
-            if self.tracer:
-                self.tracer.record_verify(passed, 0.0, f"required: {command}")
-            if passed:
+            if self._record_pass(command, turn_start):
                 return reply
             self.messages.append(
                 {
@@ -214,18 +217,69 @@ class Agent:
                 }
             )
             reply = self._run()
-        return reply  # attempts exhausted — return the last reply (accept stays red)
+        # The last re-prompt's run hasn't been checked yet — check it, then fail closed.
+        if self._record_pass(command, turn_start):
+            return reply
+        return (
+            f"{reply}\n\n[unverified: this turn changed code but no passing `{command}` "
+            f"run was observed after the change (tried {self.verify_attempts}×). "
+            "Treat the change as NOT verified.]"
+        )
 
-    def _observed_pass(self, command: str, turn_start: int) -> bool:
-        """True iff this turn's transcript holds a bash call running ``command`` that
-        exited 0 — paired by tool_call_id so a failed run is not counted as a pass."""
-        ran_ids: set[str] = set()
-        for m in self.messages[turn_start:]:
+    def _record_pass(self, command: str, turn_start: int) -> bool:
+        """Check the gate once and record the verify span; returns whether it passed."""
+        passed = self._observed_pass(command, turn_start)
+        if self.tracer:
+            self.tracer.record_verify(passed, 0.0, f"required: {command}")
+        return passed
+
+    @staticmethod
+    def _is_test_run(arguments: str, command: str) -> bool:
+        """True iff a bash call runs ``command`` up front, not wrapped or chained —
+        so ``echo 'uv run verify'`` or ``uv run verify || true`` can't spoof the gate."""
+        try:
+            cmd = json.loads(arguments or "{}").get("command", "")
+        except json.JSONDecodeError:
+            return False
+        cmd = str(cmd).strip()
+        if not cmd.startswith(command):
+            return False
+        return not any(op in cmd for op in (";", "&&", "||", "|", "`", "$("))
+
+    def _last_code_mutation(self, turn_start: int) -> int:
+        """Index of the last assistant message this turn that wrote/edited source, or -1."""
+        last = -1
+        for i in range(turn_start, len(self.messages)):
+            m = self.messages[i]
             if m.get("role") != "assistant" or not m.get("tool_calls"):
                 continue
             for tc in m["tool_calls"]:
                 fn = tc.get("function", {})
-                if fn.get("name") == "bash" and command in fn.get("arguments", ""):
+                if fn.get("name") in ("write_file", "edit_file"):
+                    try:
+                        path = json.loads(fn.get("arguments", "{}")).get("path", "")
+                    except json.JSONDecodeError:
+                        path = ""
+                    if any(path.endswith(ext) for ext in CODE_EXTENSIONS):
+                        last = i
+        return last
+
+    def _observed_pass(self, command: str, turn_start: int) -> bool:
+        """True iff this turn's transcript holds a bash call that ran ``command``
+        (unwrapped) and exited 0, at or after the last code change — so a pass from
+        *before* the final edit doesn't count as verifying it. Paired by tool_call_id
+        so a failed run is never counted as a pass."""
+        after = self._last_code_mutation(turn_start)
+        ran_ids: set[str] = set()
+        for i in range(turn_start, len(self.messages)):
+            if i < after:  # a run before the last mutation can't have verified it
+                continue
+            m = self.messages[i]
+            if m.get("role") != "assistant" or not m.get("tool_calls"):
+                continue
+            for tc in m["tool_calls"]:
+                fn = tc.get("function", {})
+                if fn.get("name") == "bash" and self._is_test_run(fn.get("arguments", ""), command):
                     ran_ids.add(tc.get("id", ""))
         if not ran_ids:
             return False
@@ -237,8 +291,11 @@ class Agent:
         )
 
     def _run(self) -> str:
-        """Drive the model, executing tool calls until it produces a final answer."""
-        self._maybe_compact()
+        """Drive the model, executing tool calls until it produces a final answer.
+
+        Compaction happens once per turn in ``send`` (before the turn is appended),
+        never here — so the verification gate's ``turn_start`` index stays valid even
+        across the re-prompt runs ``_enforce_run`` drives."""
         specs = self.tools.specs() if self.tools else None
         for _ in range(MAX_TOOL_STEPS):
             t0 = time.perf_counter()
@@ -292,7 +349,7 @@ def main() -> None:
     from harness.sandbox import Sandbox, bash_tool
     from harness.skills import load_skills
     from harness.subagents import delegate_tool, fan_out_tool
-    from harness.tools import default_tools
+    from harness.tools import default_tools, read_file_tool
     from harness.workspace import Workspace, edit_file_tool, git_worktree, write_file_tool
 
     # Work in a real project: a git worktree of this repo (your checkout stays
@@ -307,12 +364,15 @@ def main() -> None:
         print(f"not a git repo — working in a scratch dir — {workspace.root}")
 
     tools = default_tools()
+    # Read from the same tree we write to (the worktree), not the host cwd — so the
+    # model sees its own edits, and can't read the cwd's .env (API key).
+    tools.register(read_file_tool(str(workspace.root)))
     tools.register(write_file_tool(workspace))
     tools.register(edit_file_tool(workspace))
     # Trusted bash: your own project, your own test command — run for real, gated
     # by approval, not by network-none isolation (that stays for untrusted code).
     tools.register(bash_tool(Sandbox(trusted=True, timeout=120), workdir=str(workspace.root)))
-    tools.register(search_memory_tool())  # episodic recall across past sessions
+    tools.register(search_memory_tool(exclude="repl"))  # recall across *other* sessions
     tools.register(delegate_tool())  # hand a self-contained subtask to a fresh subagent
     tools.register(fan_out_tool())  # split into independent subtasks, run them in parallel
 
@@ -329,9 +389,14 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    tracer = Tracer()  # ch-13: record every step; print the timeline after each turn
+    # Resolve the provider once so the model id is known up front — the tracer needs
+    # it to price calls (else the REPL trace shows $0.0000), and the agent reuses it.
+    provider = Provider.from_env()
+    tracer = Tracer(model=provider.model)  # ch-13: record every step + price it
     agent = Agent(
         system=DEFAULT_SYSTEM,
+        provider=provider,
+        model=provider.model,
         tools=tools,
         approve=approve,
         approval_required={"bash", "write_file", "edit_file"},

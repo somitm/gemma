@@ -142,6 +142,17 @@ hand, so the standard is something you learn rather than a dependency you pull i
 offline for tests and exports to a real backend when you want it. Capturing prompts and results is
 opt-in, off by default.
 
+**The sandbox is soft on purpose; verification is not.** These are two different trust claims and the
+code treats them differently. The execution boundary has a real containment path (hardened Docker:
+network-none, non-root, cap-drop, memory and pid limits) and a *teaching-grade* local fallback that
+scrubs the environment and confines the cwd but does not isolate the filesystem — and the docstrings say
+so, rather than implying a guarantee the fallback can't keep. Building a production sandbox (gVisor, a
+microVM, container-by-default) would bury the lesson under infrastructure, so the course names the limit
+instead of hiding it. Verification integrity is the opposite: it is the thesis, so it is hard. The gate
+that decides "did the tests pass" refuses forged receipts (an `echo` of the command, a `|| true`
+wrapper), requires the passing run to come *after* the last code change, survives a mid-run compaction,
+and fails closed — an unverified change is marked unverified, never returned as clean.
+
 **Two gates, because "tests pass" is weaker than "it works."** A stub that returns the right shape
 proves nothing about a real model. So every chapter passes an offline check and then does the thing for
 real against a live model. The second gate is slower on purpose: the repo never claims a capability it
